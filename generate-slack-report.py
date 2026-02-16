@@ -38,6 +38,10 @@ def get_date_range(args):
     if args.start_date and args.end_date:
         return args.start_date, args.end_date
     
+    # If only start_date provided, use it as both start and end
+    if args.start_date:
+        return args.start_date, args.start_date
+    
     today = datetime.now()
     current_day = today.weekday()  # 0=Monday, 6=Sunday
     
