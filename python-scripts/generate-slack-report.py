@@ -55,13 +55,14 @@ def get_date_range(args):
     
     return week_start, week_end
 
-def manage_huddles_backup(huddles_path):
+def manage_huddles_backup(huddles_path, use_backup=False):
     """
     Manage backup files for slack_huddles.json:
     1. If slack_huddles.json exists:
        - Remove slack_huddles.json.bak if it exists
        - Create new .bak from current slack_huddles.json
-    2. If slack_huddles.json doesn't exist, leave old .bak in place
+    2. If slack_huddles.json doesn't exist but .bak does:
+       - Use backup if use_backup flag is True, otherwise return None
     Returns the path to the huddles file to load, or None if not found
     """
     # Expand ~ to home directory
@@ -89,16 +90,26 @@ def manage_huddles_backup(huddles_path):
             print(f"Warning: Could not create backup {backup_file}: {e}", file=sys.stderr)
         return huddles_file
     
+    # If no new file exists but backup does, check if user wants to use it
+    if os.path.exists(backup_file):
+        if use_backup:
+            print(f"Using backup file: {backup_file}", file=sys.stderr)
+            return backup_file
+        else:
+            print(f"Warning: slack_huddles.json not found, but backup exists: {backup_file}", file=sys.stderr)
+            print("Use --use-backup flag to use the backup file.", file=sys.stderr)
+            return None
+    
     # If no new file exists, leave old .bak in place
     return None
 
-def load_slack_huddles(huddles_path):
+def load_slack_huddles(huddles_path, use_backup=False):
     """
     Load Slack huddles from JSON file
     Looks for slack_huddles.json in the specified directory
     """
     # Manage backups and get file path
-    huddles_file = manage_huddles_backup(huddles_path)
+    huddles_file = manage_huddles_backup(huddles_path, use_backup)
     
     if not huddles_file:
         huddles_path = os.path.expanduser(huddles_path)
@@ -189,6 +200,7 @@ def main():
     parser.add_argument('-o', '--output', help='Output file path')
     parser.add_argument('--slack-user-id', help='Your Slack user ID (default: $SLACK_USER_ID env var)')
     parser.add_argument('--slack-huddles-path', help='Path to slack_huddles.json directory (default: ~/Downloads)')
+    parser.add_argument('--use-backup', action='store_true', help='Use slack_huddles.json.bak if main file not found')
     
     args = parser.parse_args()
     
@@ -213,7 +225,7 @@ def main():
     print("", file=sys.stderr)
     
     # Load Slack huddles from file
-    slack_huddles_raw = load_slack_huddles(slack_huddles_path)
+    slack_huddles_raw = load_slack_huddles(slack_huddles_path, args.use_backup)
     
     if not slack_huddles_raw:
         print("No huddles data loaded.", file=sys.stderr)

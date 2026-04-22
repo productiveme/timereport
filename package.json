@@ -1,0 +1,38 @@
+{
+  "name": "timereport",
+  "version": "1.0.0",
+  "description": "Generate time reports from GitHub commits, Slack huddles, and calendar events",
+  "type": "module",
+  "bin": {
+    "timr": "./bin/timr.js"
+  },
+  "main": "./src/index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "time",
+    "report",
+    "timesheet",
+    "github",
+    "slack",
+    "calendar"
+  ],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "commander": "^12.0.0",
+    "inquirer": "^9.2.15",
+    "chalk": "^5.3.0",
+    "ora": "^8.0.1",
+    "date-fns": "^3.3.1",
+    "execa": "^8.0.1"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "prettier": "^3.2.5"
+  }
+}
