@@ -17,50 +17,134 @@ export async function fetchGitHubData(
   verbose(`Fetching GitHub data for ${username} (${userEmail}) in ${org}`);
   verbose(`Date range: ${startDate} to ${endDate}`);
 
-  // Get repositories
-  const repos = await getRepositories(org);
-  verbose(`Found ${repos.length} repositories`);
+  const startDt = parseDate(startDate);
+  const endDt = parseDate(endDate);
+  endDt.setHours(23, 59, 59, 999);
 
-  // Collect PR data
-  const prData = new Map();
+  // Create a wider window for repo filtering (2 weeks before to current)
+  // This catches commits that were made during the target week but pushed later
+  const repoFilterStart = new Date(startDt);
+  repoFilterStart.setDate(repoFilterStart.getDate() - 14); // 2 weeks before
+
+  // Get repositories filtered by pushedAt date (wider window)
+  const repos = await getActiveRepositories(org, repoFilterStart, new Date());
+  verbose(`Found ${repos.length} active repositories in extended date range`);
+
+  // Map to store commits by SHA to avoid duplicates
+  const allCommits = new Map();
+
+  // Map to store PR info by commit SHA
+  const commitToPR = new Map();
 
   for (const repo of repos) {
-    const prs = await getMergedPRs(org, repo, startDate, endDate);
+    // Fetch all commits in date range for this repo
+    const commits = await getRepoCommits(
+      org,
+      repo,
+      userEmail,
+      startDate,
+      endDate,
+    );
 
-    if (prs.length > 0) {
-      verbose(`  Checking ${prs.length} PRs in ${repo}...`);
-    }
+    if (commits.length > 0) {
+      verbose(`  Found ${commits.length} commits in ${repo}`);
 
-    for (const pr of prs) {
-      const commits = await getPRCommits(
-        org,
-        repo,
-        pr.number,
-        userEmail,
-        startDate,
-        endDate,
-      );
-
-      if (commits.length > 0) {
-        const prKey = `${repo}#${pr.number}`;
-        prData.set(prKey, {
-          title: pr.title,
+      // Store commits
+      for (const commit of commits) {
+        const key = `${repo}:${commit.sha}`;
+        allCommits.set(key, {
+          ...commit,
           repo,
-          number: pr.number,
-          commits,
         });
+      }
+
+      // Fetch PRs for this repo to get PR titles
+      const prs = await getAllPRs(org, repo, startDate, endDate);
+
+      // Map commits to their PRs
+      for (const pr of prs) {
+        const prCommits = await getPRCommits(
+          org,
+          repo,
+          pr.number,
+          userEmail,
+          startDate,
+          endDate,
+        );
+
+        for (const commit of prCommits) {
+          const key = `${repo}:${commit.sha}`;
+          commitToPR.set(key, {
+            title: pr.title,
+            number: pr.number,
+          });
+        }
       }
     }
   }
 
-  verbose(`Found ${prData.size} PRs with your commits`);
+  verbose(`Found ${allCommits.size} total commits`);
 
-  // Convert to task format
+  // Group commits by task (PR or commit message)
+  // First pass: create task entries with their original names
+  const taskEntries = [];
+
+  for (const [key, commit] of allCommits) {
+    const prInfo = commitToPR.get(key);
+
+    let taskName;
+    if (prInfo) {
+      // Use PR title
+      taskName = formatTaskName(prInfo.title, commit.repo);
+    } else {
+      // Use commit message (first line only)
+      const firstLine = commit.message.split("\n")[0];
+      taskName = formatTaskName(firstLine, commit.repo);
+    }
+
+    taskEntries.push({
+      taskName,
+      commit,
+    });
+  }
+
+  // Second pass: group by hashtag and merge descriptions
+  const hashtagMap = new Map();
+
+  for (const entry of taskEntries) {
+    // Extract hashtag from task name (e.g., "#techspec" or "#eng123")
+    const hashtagMatch = entry.taskName.match(/#(\S+)$/);
+    const hashtag = hashtagMatch ? hashtagMatch[1] : entry.taskName;
+
+    // Extract description (everything before the hashtag)
+    const description = entry.taskName.replace(/#\S+$/, "").trim();
+
+    if (!hashtagMap.has(hashtag)) {
+      hashtagMap.set(hashtag, {
+        descriptions: new Set(),
+        commits: [],
+      });
+    }
+
+    const group = hashtagMap.get(hashtag);
+    if (description) {
+      group.descriptions.add(description);
+    }
+    group.commits.push(entry.commit);
+  }
+
+  // Convert to task format with merged descriptions
   const tasks = [];
-  for (const [prKey, prInfo] of prData) {
-    const taskName = formatTaskName(prInfo.title, prInfo.repo);
-    const sessions = createCommitSessions(prInfo.commits);
-    const sortTimestamp = Math.min(...prInfo.commits.map((c) => c.timestamp));
+  for (const [hashtag, group] of hashtagMap) {
+    const sessions = createCommitSessions(group.commits);
+    const sortTimestamp = Math.min(...group.commits.map((c) => c.timestamp));
+
+    // Combine descriptions into comma-separated list
+    const descriptionList = Array.from(group.descriptions);
+    const taskName =
+      descriptionList.length > 0
+        ? `${descriptionList.join(", ")} #${hashtag}`
+        : `#${hashtag}`;
 
     tasks.push({
       name: taskName,
@@ -69,39 +153,7 @@ export async function fetchGitHubData(
     });
   }
 
-  // Merge tasks with the same name
-  const mergedTasks = mergeDuplicateTasks(tasks);
-
-  return mergedTasks;
-}
-
-/**
- * Merge tasks that have the same name
- */
-function mergeDuplicateTasks(tasks) {
-  const taskMap = new Map();
-
-  for (const task of tasks) {
-    if (taskMap.has(task.name)) {
-      // Task with this name already exists, merge sessions
-      const existing = taskMap.get(task.name);
-      existing.sessions.push(...task.sessions);
-      // Update sort timestamp to earliest
-      existing.sort_timestamp = Math.min(
-        existing.sort_timestamp,
-        task.sort_timestamp,
-      );
-    } else {
-      // New task, make a copy to avoid mutations
-      taskMap.set(task.name, {
-        name: task.name,
-        sessions: [...task.sessions],
-        sort_timestamp: task.sort_timestamp,
-      });
-    }
-  }
-
-  return Array.from(taskMap.values());
+  return tasks;
 }
 
 async function getGitHubUsername() {
@@ -114,7 +166,7 @@ async function getGitUserEmail() {
   return stdout.trim();
 }
 
-async function getRepositories(org) {
+async function getActiveRepositories(org, startDate, endDate) {
   const { stdout } = await execa("gh", [
     "repo",
     "list",
@@ -122,13 +174,20 @@ async function getRepositories(org) {
     "--limit",
     "1000",
     "--json",
-    "name",
+    "name,pushedAt",
   ]);
   const repos = JSON.parse(stdout);
-  return repos.map((r) => r.name);
+
+  // Filter repos that were pushed to during the date range
+  const activeRepos = repos.filter((repo) => {
+    const pushedAt = new Date(repo.pushedAt);
+    return pushedAt >= startDate && pushedAt <= endDate;
+  });
+
+  return activeRepos.map((r) => r.name);
 }
 
-async function getMergedPRs(org, repo, startDate, endDate) {
+async function getAllPRs(org, repo, startDate, endDate) {
   try {
     const { stdout } = await execa("gh", [
       "pr",
@@ -136,15 +195,148 @@ async function getMergedPRs(org, repo, startDate, endDate) {
       "--repo",
       `${org}/${repo}`,
       "--state",
-      "merged",
+      "all",
       "--search",
-      `merged:${startDate}..${endDate}`,
+      `created:${startDate}..${endDate}`,
       "--json",
       "number,title",
       "--limit",
       "100",
     ]);
     return JSON.parse(stdout);
+  } catch {
+    return [];
+  }
+}
+
+async function getRepoCommits(org, repo, userEmail, startDate, endDate) {
+  try {
+    const startDt = parseDate(startDate);
+    const endDt = parseDate(endDate);
+    endDt.setHours(23, 59, 59, 999);
+
+    // Get all branches with their last commit dates
+    const branches = await getActiveBranches(org, repo, startDt, endDt);
+
+    if (branches.length === 0) {
+      return [];
+    }
+
+    verbose(`    Checking ${branches.length} active branches in ${repo}`);
+
+    const allCommits = new Map(); // Use Map to dedupe by SHA
+
+    // Fetch commits from each active branch using GraphQL
+    for (const branch of branches) {
+      try {
+        const { stdout } = await execa("gh", [
+          "api",
+          "graphql",
+          "-f",
+          `query=
+{
+  repository(owner: "${org}", name: "${repo}") {
+    ref(qualifiedName: "refs/heads/${branch}") {
+      target {
+        ... on Commit {
+          history(first: 100, author: {emails: ["${userEmail}"]}) {
+            edges {
+              node {
+                oid
+                message
+                committedDate
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`,
+          "--jq",
+          ".data.repository.ref.target.history.edges[] | .node | {sha: .oid, message: .message, date: .committedDate}",
+        ]);
+
+        if (!stdout.trim()) continue;
+
+        for (const line of stdout.trim().split("\n")) {
+          if (!line.trim()) continue;
+
+          try {
+            const commit = JSON.parse(line);
+            const commitDate = new Date(commit.date);
+
+            // Filter by date range
+            if (commitDate >= startDt && commitDate <= endDt) {
+              // Use SHA as key to avoid duplicates across branches
+              if (!allCommits.has(commit.sha)) {
+                allCommits.set(commit.sha, {
+                  sha: commit.sha,
+                  message: commit.message,
+                  date: commitDate,
+                  timestamp: dateToTimestamp(commitDate),
+                });
+              }
+            }
+          } catch (err) {
+            // Skip malformed JSON lines
+            continue;
+          }
+        }
+      } catch {
+        // Skip branches that error
+        continue;
+      }
+    }
+
+    return Array.from(allCommits.values());
+  } catch {
+    return [];
+  }
+}
+
+async function getActiveBranches(org, repo, startDate, endDate) {
+  try {
+    const { stdout } = await execa("gh", [
+      "api",
+      `repos/${org}/${repo}/branches`,
+      "--jq",
+      ".[].name",
+    ]);
+
+    const branchNames = stdout
+      .trim()
+      .split("\n")
+      .filter((b) => b.trim());
+
+    // For each branch, check if it has commits in our date range
+    const activeBranches = [];
+
+    for (const branch of branchNames) {
+      try {
+        // Get the latest commit date on this branch
+        const { stdout: commitInfo } = await execa("gh", [
+          "api",
+          `repos/${org}/${repo}/commits/${branch}`,
+          "--jq",
+          ".commit.author.date",
+        ]);
+
+        const lastCommitDate = new Date(commitInfo.trim());
+
+        // Only include branch if its last commit is within or after our date range
+        // (commits could be older on the branch, but if the last commit is before startDate,
+        // we can skip this branch entirely)
+        if (lastCommitDate >= startDate) {
+          activeBranches.push(branch);
+        }
+      } catch {
+        // If we can't get commit info, skip this branch
+        continue;
+      }
+    }
+
+    return activeBranches;
   } catch {
     return [];
   }
